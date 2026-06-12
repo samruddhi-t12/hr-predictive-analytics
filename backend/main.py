@@ -1,14 +1,21 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from contextlib import asynccontextmanager
 import joblib
 import pandas as pd
+import shap
+import io
+import time
+from statistics import mean
+from collections import deque
 
 from google import genai
 import os
 from dotenv import load_dotenv
 from passlib.context import CryptContext
 from pydantic import BaseModel
+from typing import Dict, Any
 
 # --- 1. CONFIGURATION & SECURITY ---
 load_dotenv()
@@ -31,17 +38,8 @@ def get_password_hash(password):
 from backend import models
 from backend.database import engine, SessionLocal
 
+# This line is brilliant for Postgres: it will automatically build all your tables in Neon!
 models.Base.metadata.create_all(bind=engine)
-
-app = FastAPI(title="Nexus HR Predictive Analytics API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 class LoginRequest(BaseModel):
     email: str
@@ -67,17 +65,45 @@ class PulseUpdate(BaseModel):
     environment_satisfaction: int
     over_time: str
 
-# --- 3. ML MODEL LOADING ---
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(BASE_DIR, 'ml_engine', 'attrition_model.pkl')
-FEATURES_PATH = os.path.join(BASE_DIR, 'ml_engine', 'model_features.pkl')
+# --- 3. ML MODEL LOADING (LIFESPAN) ---
+ml_assets: Dict[str, Any] = {}
 
-try:
-    model = joblib.load(MODEL_PATH)
-    model_features = joblib.load(FEATURES_PATH)
-    print("AI Model loaded successfully!")
-except Exception as e:
-    print(f"Startup Warning: Could not load ML model. Error: {e}")
+# --- LIVE TELEMETRY & DRIFT MONITORING ---
+# We use deque with a maxlen to keep a rolling window of the last 1000 predictions
+# This prevents memory leaks while giving us enough data to detect statistical drift.
+monitoring_stats = {
+    "total_predictions": 0,
+    "inference_latency_ms": deque(maxlen=1000), 
+    "rolling_probabilities": deque(maxlen=1000),
+    "baseline_attrition_rate": 0.161 # The original IBM dataset attrition rate (16.1%)
+}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ML_DIR = os.path.join(BASE_DIR, 'ml_engine')
+    
+    try:
+        ml_assets['model'] = joblib.load(os.path.join(ML_DIR, 'attrition_model.pkl'))
+        ml_assets['scaler'] = joblib.load(os.path.join(ML_DIR, 'scaler.pkl'))
+        ml_assets['features'] = joblib.load(os.path.join(ML_DIR, 'model_features.pkl'))
+        ml_assets['explainer'] = joblib.load(os.path.join(ML_DIR, 'shap_explainer.pkl'))
+        print("AI Model, Scaler, Features, and SHAP Explainer loaded successfully!")
+    except Exception as e:
+        print(f"Startup Warning: Could not load ML models. Error: {e}")
+        
+    yield
+    ml_assets.clear()
+
+app = FastAPI(title="Nexus HR Predictive Analytics API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def get_db():
     db = SessionLocal()
@@ -91,7 +117,7 @@ def get_db():
 def seed_data():
     db = SessionLocal()
     if not db.query(models.Employee).first():
-        print("Seeding database with test Admin and Employee...")
+        print("Seeding PostgreSQL database with test Admin and Employee...")
         
         admin = models.Employee(
             email="admin@company.com", password_hash=get_password_hash("admin123"),
@@ -155,6 +181,9 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 
 @app.get("/analyze-employee/{emp_id}")
 def analyze_employee(emp_id: int, role: str = "admin", db: Session = Depends(get_db)):
+    if not ml_assets:
+        raise HTTPException(status_code=503, detail="ML Engine not fully initialized.")
+
     employee = db.query(models.Employee).filter(models.Employee.id == emp_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found in database")
@@ -177,19 +206,39 @@ def analyze_employee(emp_id: int, role: str = "admin", db: Session = Depends(get
     try:
         df_input = pd.DataFrame([ai_input])
         df_input = pd.get_dummies(df_input)
-        df_input = df_input.reindex(columns=model_features, fill_value=0)
+        df_input = df_input.reindex(columns=ml_assets['features'], fill_value=0)
         
-        prediction = model.predict(df_input)
-        probability = model.predict_proba(df_input)[0][1] 
-        is_high_risk = prediction[0] == 1
+        scaled_array = ml_assets['scaler'].transform(df_input)
+        scaled_df = pd.DataFrame(scaled_array, columns=ml_assets['features'])
+        
+        # --- START TELEMETRY TIMER ---
+        start_time = time.perf_counter()
+        
+        prediction = ml_assets['model'].predict(scaled_array)
+        probability = float(ml_assets['model'].predict_proba(scaled_array)[0][1])
+        
+        # --- END TELEMETRY TIMER ---
+        inference_time_ms = (time.perf_counter() - start_time) * 1000
+        
+        # Log to global monitor
+        monitoring_stats["total_predictions"] += 1
+        monitoring_stats["inference_latency_ms"].append(inference_time_ms)
+        monitoring_stats["rolling_probabilities"].append(probability)
 
-        print(f"Generating custom strategy via Gemini LLM for role: {role}...")
+        is_high_risk = prediction[0] == 1
+        shap_vals = ml_assets['explainer'](scaled_df).values[0]
+        impacts = [{"feature_name": f, "impact_weight": float(v)} for f, v in zip(ml_assets['features'], shap_vals)]
+        top_reasons = sorted(impacts, key=lambda x: abs(x["impact_weight"]), reverse=True)[:3]
         
         if role == "admin":
             prompt = f"""
             You are an expert HR Director. An employee named {employee.name} in the {employee.department} department has a {round(probability * 100)}% probability of resigning.
+            Top ML identified risk/retention drivers: 
+            1. {top_reasons[0]['feature_name']} (SHAP Impact: {top_reasons[0]['impact_weight']:.2f})
+            2. {top_reasons[1]['feature_name']} (SHAP Impact: {top_reasons[1]['impact_weight']:.2f})
+            3. {top_reasons[2]['feature_name']} (SHAP Impact: {top_reasons[2]['impact_weight']:.2f})
             Key metrics: Age: {employee.age}, Monthly Income: ${employee.monthly_income}, Commute: {employee.distance_from_home} miles, Overtime: {employee.over_time}.
-            If the risk is high, write a 3-step retention rescue plan. If the risk is low, write a 3-step career growth plan to keep them engaged. 
+            If the risk is high, write a 3-step retention rescue plan addressing the top drivers. If the risk is low, write a 3-step career growth plan to keep them engaged. 
             Keep it highly specific, professional, and under 100 words. Format with clean bullet points.
             """
         else:
@@ -197,7 +246,7 @@ def analyze_employee(emp_id: int, role: str = "admin", db: Session = Depends(get
             You are an expert Career Mentor advising {employee.name} in the {employee.department} department.
             Key metrics: Age: {employee.age}, Commute: {employee.distance_from_home} miles, Overtime: {employee.over_time}, Job Level: {employee.job_level}.
             Write a 3-step personalized career growth and upskilling roadmap for them. Focus on maximizing their potential, work-life balance, and future success.
-            CRITICAL: DO NOT mention flight risk, retention, or resignation probabilities. Keep it encouraging, professional, and under 100 words. Format with clean bullet points.
+            CRITICAL: DO NOT mention flight risk, retention, resignation probabilities, or SHAP drivers. Keep it encouraging, professional, and under 100 words. Format with clean bullet points.
             """
         
         try:
@@ -213,6 +262,7 @@ def analyze_employee(emp_id: int, role: str = "admin", db: Session = Depends(get
             "ai_analysis": {
                 "flight_risk_probability": round(probability * 100, 2) if role == "admin" else None,
                 "status": ("High Risk (Will Quit)" if is_high_risk else "Safe (Will Stay)") if role == "admin" else "Active Profile",
+                "top_drivers": top_reasons if role == "admin" else None,
                 "strategy": strategy_text 
             }
         }
@@ -233,15 +283,18 @@ def update_pulse(emp_id: int, pulse: PulseUpdate, db: Session = Depends(get_db))
 
 @app.get("/company-overview")
 def get_company_overview(db: Session = Depends(get_db)):
+    if not ml_assets:
+        raise HTTPException(status_code=503, detail="ML Engine not fully initialized.")
+
     employees = db.query(models.Employee).all()
     if not employees:
         return {"total_headcount": 0, "global_risk": 0, "departments": []}
 
-    dept_stats = {}
-    total_risk = 0
-
+    # --- ENTERPRISE VECTORIZATION OPTIMIZATION ---
+    # Instead of predicting 1-by-1 in a slow loop, we build one massive matrix
+    emp_data = []
     for emp in employees:
-        ai_input = {
+        emp_data.append({
             "Age": emp.age, "MonthlyIncome": emp.monthly_income, "DistanceFromHome": emp.distance_from_home, 
             "OverTime": emp.over_time, "DailyRate": emp.daily_rate, "EnvironmentSatisfaction": emp.environment_satisfaction, 
             "HourlyRate": emp.hourly_rate, "JobInvolvement": emp.job_involvement, "JobLevel": emp.job_level, 
@@ -252,20 +305,30 @@ def get_company_overview(db: Session = Depends(get_db)):
             "YearsWithCurrManager": emp.years_with_curr_manager, "BusinessTravel": emp.business_travel, 
             "Department": emp.department, "EducationField": emp.education_field, "Gender": emp.gender,
             "JobRole": emp.job_role, "MaritalStatus": emp.marital_status
-        }
-        df_input = pd.DataFrame([ai_input])
-        df_input = pd.get_dummies(df_input)
-        df_input = df_input.reindex(columns=model_features, fill_value=0)
-        
-        probability = model.predict_proba(df_input)[0][1] * 100
-        total_risk += probability
+        })
 
+    # Execute math on the entire company simultaneously 
+    df_input = pd.DataFrame(emp_data)
+    df_input = pd.get_dummies(df_input)
+    df_input = df_input.reindex(columns=ml_assets['features'], fill_value=0)
+    
+    scaled_matrix = ml_assets['scaler'].transform(df_input)
+    probabilities = ml_assets['model'].predict_proba(scaled_matrix)[:, 1] * 100
+
+    dept_stats = {}
+    total_risk = 0
+
+    # Map the instantly calculated probabilities back to the departments
+    for idx, emp in enumerate(employees):
+        prob = probabilities[idx]
+        total_risk += prob
+        
         dept = emp.department
         if dept not in dept_stats:
             dept_stats[dept] = {"count": 0, "total_risk": 0}
         
         dept_stats[dept]["count"] += 1
-        dept_stats[dept]["total_risk"] += probability
+        dept_stats[dept]["total_risk"] += prob
 
     global_avg_risk = total_risk / len(employees)
 
@@ -281,4 +344,145 @@ def get_company_overview(db: Session = Depends(get_db)):
         "total_headcount": len(employees),
         "global_risk": round(global_avg_risk, 1),
         "departments": dept_data_list
+    }
+
+@app.post("/batch-predict")
+async def batch_predict(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    Enterprise bulk inference endpoint and ETL pipeline. 
+    Accepts a CSV, vectorizes data in-memory, runs ML predictions, 
+    and synchronizes missing employees into the PostgreSQL database.
+    """
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Invalid file type. Only CSV files are supported.")
+    
+    try:
+        # Read the uploaded file directly into memory
+        contents = await file.read()
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        
+        identifiers = df.get('EmployeeNumber', df.index).tolist()
+        departments = df.get('Department', ['Unknown'] * len(df)).tolist()
+        
+        # --- 1. ETL PIPELINE: POSTGRESQL SYNCHRONIZATION ---
+        existing_ids = {emp.id for emp in db.query(models.Employee.id).all()}
+        new_employees = []
+        default_hash = get_password_hash("nexus2026") # Default temp password for bulk-loaded users
+
+        for index, row in df.iterrows():
+            emp_id = int(row.get('EmployeeNumber', index + 1000))
+            
+            # If the ML Engine sees an employee not in PostgreSQL, queue them for creation
+            if emp_id not in existing_ids:
+                new_emp = models.Employee(
+                    id=emp_id,
+                    email=f"employee{emp_id}@company.com",
+                    password_hash=default_hash,
+                    role="employee",
+                    name=f"Employee #{emp_id}",
+                    department=str(row.get('Department', 'Unknown')),
+                    age=int(row.get('Age', 30)),
+                    gender=str(row.get('Gender', 'Male')),
+                    marital_status=str(row.get('MaritalStatus', 'Single')),
+                    education_field=str(row.get('EducationField', 'Other')),
+                    distance_from_home=int(row.get('DistanceFromHome', 5)),
+                    job_role=str(row.get('JobRole', 'Staff')),
+                    job_level=int(row.get('JobLevel', 1)),
+                    monthly_income=int(row.get('MonthlyIncome', 5000)),
+                    daily_rate=int(row.get('DailyRate', 800)),
+                    hourly_rate=int(row.get('HourlyRate', 50)),
+                    num_companies_worked=int(row.get('NumCompaniesWorked', 1)),
+                    total_working_years=int(row.get('TotalWorkingYears', 5)),
+                    years_at_company=int(row.get('YearsAtCompany', 2)),
+                    years_in_current_role=int(row.get('YearsInCurrentRole', 2)),
+                    years_since_last_promotion=int(row.get('YearsSinceLastPromotion', 1)),
+                    years_with_curr_manager=int(row.get('YearsWithCurrManager', 2)),
+                    percent_salary_hike=int(row.get('PercentSalaryHike', 10)),
+                    performance_rating=int(row.get('PerformanceRating', 3)),
+                    business_travel=str(row.get('BusinessTravel', 'Travel_Rarely')),
+                    over_time=str(row.get('OverTime', 'No')),
+                    environment_satisfaction=int(row.get('EnvironmentSatisfaction', 3)),
+                    job_involvement=int(row.get('JobInvolvement', 3)),
+                    job_satisfaction=int(row.get('JobSatisfaction', 3))
+                )
+                new_employees.append(new_emp)
+                existing_ids.add(emp_id) # Prevent duplicates if CSV has repeating IDs
+
+        # Execute bulk database insert in a single transaction for maximum speed
+        if new_employees:
+            db.add_all(new_employees)
+            db.commit()
+            print(f"ETL Pipeline: Successfully synchronized {len(new_employees)} records to PostgreSQL.")
+
+        # --- 2. ML INFERENCE PIPELINE ---
+        df_processed = pd.get_dummies(df)
+        df_processed = df_processed.reindex(columns=ml_assets['features'], fill_value=0)
+        
+        scaled_matrix = ml_assets['scaler'].transform(df_processed)
+        probabilities = ml_assets['model'].predict_proba(scaled_matrix)[:, 1]
+        
+        results = []
+        for idx, prob in enumerate(probabilities):
+            if prob > 0.50:  
+                results.append({
+                    "employee_id": int(identifiers[idx]),
+                    "department": str(departments[idx]),
+                    "flight_risk_probability": round(float(prob * 100), 2)
+                })
+                
+        sorted_results = sorted(results, key=lambda x: x['flight_risk_probability'], reverse=True)
+        
+        return {
+            "status": "success",
+            "total_records_processed": len(df),
+            "critical_flight_risks": len(sorted_results),
+            "actionable_targets": sorted_results[:100]  
+        }
+        
+    except pd.errors.EmptyDataError:
+        raise HTTPException(status_code=400, detail="The uploaded CSV file is empty.")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Batch processing failed: {str(e)}")
+
+
+@app.get("/model-health")
+async def get_model_health():
+    """
+    Production Observability Endpoint. 
+    Monitors inference latency and detects statistical data drift.
+    """
+    if not ml_assets:
+        return {"status": "offline", "detail": "ML Engine not initialized"}
+
+    if monitoring_stats["total_predictions"] == 0:
+        return {"status": "healthy", "detail": "Awaiting initial inference traffic"}
+
+    # Calculate rolling averages
+    avg_latency = mean(monitoring_stats["inference_latency_ms"])
+    avg_prob = mean(monitoring_stats["rolling_probabilities"])
+    
+    # --- DRIFT DETECTION LOGIC ---
+    # If our rolling average probability diverges from the training baseline by more than 15%, 
+    # the underlying real-world data has shifted (e.g., a massive wave of resignations or bad data input).
+    drift_detected = False
+    drift_variance = abs(avg_prob - monitoring_stats["baseline_attrition_rate"])
+    if drift_variance > 0.15 and len(monitoring_stats["rolling_probabilities"]) > 50:
+        drift_detected = True
+
+    return {
+        "system_status": "healthy",
+        "model_version": "Logistic_Regression_v1.0",
+        "telemetry": {
+            "total_inferences_served": monitoring_stats["total_predictions"],
+            "average_latency_ms": round(avg_latency, 2),
+            "p99_latency_ms": round(max(monitoring_stats["inference_latency_ms"]), 2)
+        },
+        "drift_monitoring": {
+            "baseline_training_attrition": f"{monitoring_stats['baseline_attrition_rate'] * 100}%",
+            "current_rolling_attrition": f"{round(avg_prob * 100, 2)}%",
+            "drift_detected": drift_detected,
+            "status_message": "WARNING: High Data Drift Detected. Model Retraining Recommended." if drift_detected else "Nominal. Model distribution matches training baseline."
+        }
     }
