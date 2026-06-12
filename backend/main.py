@@ -35,8 +35,8 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 # --- 2. DATABASE & SCHEMAS ---
-from backend import models
-from backend.database import engine, SessionLocal
+import models
+from database import engine, SessionLocal
 
 # This line is brilliant for Postgres: it will automatically build all your tables in Neon!
 models.Base.metadata.create_all(bind=engine)
