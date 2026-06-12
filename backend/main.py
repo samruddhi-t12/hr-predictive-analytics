@@ -34,11 +34,18 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return pwd_context.hash(password)
 
+# --- LIVE TELEMETRY & DRIFT MONITORING ---
+monitoring_stats = {
+    "total_predictions": 0,
+    "inference_latency_ms": deque(maxlen=1000), 
+    "rolling_probabilities": deque(maxlen=1000),
+    "baseline_attrition_rate": 0.161 
+}
+
 # --- 2. DATABASE & SCHEMAS ---
 import models
 from database import engine, SessionLocal
 
-# This line is brilliant for Postgres: it will automatically build all your tables in Neon!
 models.Base.metadata.create_all(bind=engine)
 
 class LoginRequest(BaseModel):
@@ -68,19 +75,10 @@ class PulseUpdate(BaseModel):
 # --- 3. ML MODEL LOADING (LIFESPAN) ---
 ml_assets: Dict[str, Any] = {}
 
-# --- LIVE TELEMETRY & DRIFT MONITORING ---
-# We use deque with a maxlen to keep a rolling window of the last 1000 predictions
-# This prevents memory leaks while giving us enough data to detect statistical drift.
-monitoring_stats = {
-    "total_predictions": 0,
-    "inference_latency_ms": deque(maxlen=1000), 
-    "rolling_probabilities": deque(maxlen=1000),
-    "baseline_attrition_rate": 0.161 # The original IBM dataset attrition rate (16.1%)
-}
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Updated to dynamically find the ml_engine folder relative to this exact file
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     ML_DIR = os.path.join(BASE_DIR, 'ml_engine')
     
     try:
@@ -211,21 +209,17 @@ def analyze_employee(emp_id: int, role: str = "admin", db: Session = Depends(get
         scaled_array = ml_assets['scaler'].transform(df_input)
         scaled_df = pd.DataFrame(scaled_array, columns=ml_assets['features'])
         
-        # --- START TELEMETRY TIMER ---
         start_time = time.perf_counter()
-        
         prediction = ml_assets['model'].predict(scaled_array)
         probability = float(ml_assets['model'].predict_proba(scaled_array)[0][1])
-        
-        # --- END TELEMETRY TIMER ---
         inference_time_ms = (time.perf_counter() - start_time) * 1000
         
-        # Log to global monitor
         monitoring_stats["total_predictions"] += 1
         monitoring_stats["inference_latency_ms"].append(inference_time_ms)
         monitoring_stats["rolling_probabilities"].append(probability)
 
         is_high_risk = prediction[0] == 1
+
         shap_vals = ml_assets['explainer'](scaled_df).values[0]
         impacts = [{"feature_name": f, "impact_weight": float(v)} for f, v in zip(ml_assets['features'], shap_vals)]
         top_reasons = sorted(impacts, key=lambda x: abs(x["impact_weight"]), reverse=True)[:3]
@@ -290,8 +284,6 @@ def get_company_overview(db: Session = Depends(get_db)):
     if not employees:
         return {"total_headcount": 0, "global_risk": 0, "departments": []}
 
-    # --- ENTERPRISE VECTORIZATION OPTIMIZATION ---
-    # Instead of predicting 1-by-1 in a slow loop, we build one massive matrix
     emp_data = []
     for emp in employees:
         emp_data.append({
@@ -307,7 +299,6 @@ def get_company_overview(db: Session = Depends(get_db)):
             "JobRole": emp.job_role, "MaritalStatus": emp.marital_status
         })
 
-    # Execute math on the entire company simultaneously 
     df_input = pd.DataFrame(emp_data)
     df_input = pd.get_dummies(df_input)
     df_input = df_input.reindex(columns=ml_assets['features'], fill_value=0)
@@ -318,7 +309,6 @@ def get_company_overview(db: Session = Depends(get_db)):
     dept_stats = {}
     total_risk = 0
 
-    # Map the instantly calculated probabilities back to the departments
     for idx, emp in enumerate(employees):
         prob = probabilities[idx]
         total_risk += prob
@@ -348,73 +338,47 @@ def get_company_overview(db: Session = Depends(get_db)):
 
 @app.post("/batch-predict")
 async def batch_predict(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """
-    Enterprise bulk inference endpoint and ETL pipeline. 
-    Accepts a CSV, vectorizes data in-memory, runs ML predictions, 
-    and synchronizes missing employees into the PostgreSQL database.
-    """
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Invalid file type. Only CSV files are supported.")
     
     try:
-        # Read the uploaded file directly into memory
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
         
         identifiers = df.get('EmployeeNumber', df.index).tolist()
         departments = df.get('Department', ['Unknown'] * len(df)).tolist()
         
-        # --- 1. ETL PIPELINE: POSTGRESQL SYNCHRONIZATION ---
         existing_ids = {emp.id for emp in db.query(models.Employee.id).all()}
         new_employees = []
-        default_hash = get_password_hash("nexus2026") # Default temp password for bulk-loaded users
+        default_hash = get_password_hash("nexus2026")
 
         for index, row in df.iterrows():
             emp_id = int(row.get('EmployeeNumber', index + 1000))
             
-            # If the ML Engine sees an employee not in PostgreSQL, queue them for creation
             if emp_id not in existing_ids:
                 new_emp = models.Employee(
-                    id=emp_id,
-                    email=f"employee{emp_id}@company.com",
-                    password_hash=default_hash,
-                    role="employee",
-                    name=f"Employee #{emp_id}",
-                    department=str(row.get('Department', 'Unknown')),
-                    age=int(row.get('Age', 30)),
-                    gender=str(row.get('Gender', 'Male')),
-                    marital_status=str(row.get('MaritalStatus', 'Single')),
-                    education_field=str(row.get('EducationField', 'Other')),
-                    distance_from_home=int(row.get('DistanceFromHome', 5)),
-                    job_role=str(row.get('JobRole', 'Staff')),
-                    job_level=int(row.get('JobLevel', 1)),
-                    monthly_income=int(row.get('MonthlyIncome', 5000)),
-                    daily_rate=int(row.get('DailyRate', 800)),
-                    hourly_rate=int(row.get('HourlyRate', 50)),
-                    num_companies_worked=int(row.get('NumCompaniesWorked', 1)),
-                    total_working_years=int(row.get('TotalWorkingYears', 5)),
-                    years_at_company=int(row.get('YearsAtCompany', 2)),
-                    years_in_current_role=int(row.get('YearsInCurrentRole', 2)),
-                    years_since_last_promotion=int(row.get('YearsSinceLastPromotion', 1)),
-                    years_with_curr_manager=int(row.get('YearsWithCurrManager', 2)),
-                    percent_salary_hike=int(row.get('PercentSalaryHike', 10)),
-                    performance_rating=int(row.get('PerformanceRating', 3)),
-                    business_travel=str(row.get('BusinessTravel', 'Travel_Rarely')),
-                    over_time=str(row.get('OverTime', 'No')),
-                    environment_satisfaction=int(row.get('EnvironmentSatisfaction', 3)),
-                    job_involvement=int(row.get('JobInvolvement', 3)),
+                    id=emp_id, email=f"employee{emp_id}@company.com", password_hash=default_hash,
+                    role="employee", name=f"Employee #{emp_id}", department=str(row.get('Department', 'Unknown')),
+                    age=int(row.get('Age', 30)), gender=str(row.get('Gender', 'Male')),
+                    marital_status=str(row.get('MaritalStatus', 'Single')), education_field=str(row.get('EducationField', 'Other')),
+                    distance_from_home=int(row.get('DistanceFromHome', 5)), job_role=str(row.get('JobRole', 'Staff')),
+                    job_level=int(row.get('JobLevel', 1)), monthly_income=int(row.get('MonthlyIncome', 5000)),
+                    daily_rate=int(row.get('DailyRate', 800)), hourly_rate=int(row.get('HourlyRate', 50)),
+                    num_companies_worked=int(row.get('NumCompaniesWorked', 1)), total_working_years=int(row.get('TotalWorkingYears', 5)),
+                    years_at_company=int(row.get('YearsAtCompany', 2)), years_in_current_role=int(row.get('YearsInCurrentRole', 2)),
+                    years_since_last_promotion=int(row.get('YearsSinceLastPromotion', 1)), years_with_curr_manager=int(row.get('YearsWithCurrManager', 2)),
+                    percent_salary_hike=int(row.get('PercentSalaryHike', 10)), performance_rating=int(row.get('PerformanceRating', 3)),
+                    business_travel=str(row.get('BusinessTravel', 'Travel_Rarely')), over_time=str(row.get('OverTime', 'No')),
+                    environment_satisfaction=int(row.get('EnvironmentSatisfaction', 3)), job_involvement=int(row.get('JobInvolvement', 3)),
                     job_satisfaction=int(row.get('JobSatisfaction', 3))
                 )
                 new_employees.append(new_emp)
-                existing_ids.add(emp_id) # Prevent duplicates if CSV has repeating IDs
+                existing_ids.add(emp_id)
 
-        # Execute bulk database insert in a single transaction for maximum speed
         if new_employees:
             db.add_all(new_employees)
             db.commit()
-            print(f"ETL Pipeline: Successfully synchronized {len(new_employees)} records to PostgreSQL.")
 
-        # --- 2. ML INFERENCE PIPELINE ---
         df_processed = pd.get_dummies(df)
         df_processed = df_processed.reindex(columns=ml_assets['features'], fill_value=0)
         
@@ -446,26 +410,17 @@ async def batch_predict(file: UploadFile = File(...), db: Session = Depends(get_
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Batch processing failed: {str(e)}")
 
-
 @app.get("/model-health")
 async def get_model_health():
-    """
-    Production Observability Endpoint. 
-    Monitors inference latency and detects statistical data drift.
-    """
     if not ml_assets:
         return {"status": "offline", "detail": "ML Engine not initialized"}
 
     if monitoring_stats["total_predictions"] == 0:
         return {"status": "healthy", "detail": "Awaiting initial inference traffic"}
 
-    # Calculate rolling averages
     avg_latency = mean(monitoring_stats["inference_latency_ms"])
     avg_prob = mean(monitoring_stats["rolling_probabilities"])
     
-    # --- DRIFT DETECTION LOGIC ---
-    # If our rolling average probability diverges from the training baseline by more than 15%, 
-    # the underlying real-world data has shifted (e.g., a massive wave of resignations or bad data input).
     drift_detected = False
     drift_variance = abs(avg_prob - monitoring_stats["baseline_attrition_rate"])
     if drift_variance > 0.15 and len(monitoring_stats["rolling_probabilities"]) > 50:
