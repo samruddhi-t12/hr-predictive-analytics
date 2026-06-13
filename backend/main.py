@@ -9,11 +9,11 @@ import io
 import time
 from statistics import mean
 from collections import deque
+import bcrypt
 
 from google import genai
 import os
 from dotenv import load_dotenv
-from passlib.context import CryptContext
 from pydantic import BaseModel
 from typing import Dict, Any
 
@@ -26,13 +26,14 @@ if not secure_api_key:
 
 client = genai.Client(api_key=secure_api_key)
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
+# Modern bcrypt implementation directly replacing passlib
 def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 def get_password_hash(password):
-    return pwd_context.hash(password)
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed.decode('utf-8')
 
 # --- LIVE TELEMETRY & DRIFT MONITORING ---
 monitoring_stats = {
@@ -77,7 +78,6 @@ ml_assets: Dict[str, Any] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Updated to dynamically find the ml_engine folder relative to this exact file
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     ML_DIR = os.path.join(BASE_DIR, 'ml_engine')
     
@@ -97,7 +97,11 @@ app = FastAPI(title="Nexus HR Predictive Analytics API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=[
+        "https://hr-predictive-analytics.vercel.app", 
+        "http://localhost:3000",
+        "http://localhost:5173"
+    ], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
