@@ -35,7 +35,7 @@ export default function EmployeeDashboard({ user, onLogout }) {
   useEffect(() => {
     const loadMyData = async () => {
       try {
-        const response = await axios.get(`http://127.0.0.1:8000/analyze-employee/${user.user_id}?role=employee`);
+        const response = await axios.get(`https://hr-predictive-analytics.onrender.com/${user.user_id}?role=employee`);
         setResult(response.data);
       } catch (err) {
         console.error("Failed to load profile", err);

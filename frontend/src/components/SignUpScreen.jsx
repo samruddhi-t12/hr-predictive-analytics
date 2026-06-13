@@ -29,7 +29,7 @@ export default function SignUpScreen({ onNavigate }) {
     }
 
     try {
-      await axios.post('http://127.0.0.1:8000/register', {
+      await axios.post('https://hr-predictive-analytics.onrender.com/register', {
         email: formData.email,
         password: formData.password,
         name: formData.name,

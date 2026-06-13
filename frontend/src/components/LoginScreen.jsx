@@ -13,7 +13,7 @@ export default function LoginScreen({ onLogin, onNavigate }) {
     setIsLoading(true);
     setError('');
     try {
-      const res = await axios.post('http://127.0.0.1:8000/login', { email, password });
+      const res = await axios.post('https://hr-predictive-analytics.onrender.com/login', { email, password });
       onLogin(res.data);
     } catch (err) {
       setError('Invalid corporate credentials');

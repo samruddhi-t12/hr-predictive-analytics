@@ -37,7 +37,7 @@ export default function AdminDashboard({ user, onLogout }) {
   const fetchCompanyOverview = async () => {
     setLoadingEagle(true);
     try {
-      const response = await axios.get('http://127.0.0.1:8000/company-overview');
+      const response = await axios.get('https://hr-predictive-analytics.onrender.com/company-overview');
       setCompanyData(response.data);
     } catch (err) {
       console.error("Failed to load company overview", err);
@@ -48,7 +48,7 @@ export default function AdminDashboard({ user, onLogout }) {
   const fetchModelHealth = async () => {
     setHealthLoading(true);
     try {
-      const response = await axios.get('http://127.0.0.1:8000/model-health');
+      const response = await axios.get('https://hr-predictive-analytics.onrender.com/model-health');
       setHealthData(response.data);
     } catch (err) {
       console.error("Failed to fetch model health", err);
@@ -61,7 +61,7 @@ export default function AdminDashboard({ user, onLogout }) {
     setLoading(true); 
     setError('');
     try {
-      const response = await axios.get(`http://127.0.0.1:8000/analyze-employee/${empId}?role=admin`);
+      const response = await axios.get(`https://hr-predictive-analytics.onrender.com/analyze-employee/${empId}?role=admin`);
       setResult(response.data);
     } catch (err) {
       setError("Employee not found in the database.");
@@ -84,7 +84,7 @@ export default function AdminDashboard({ user, onLogout }) {
     formData.append("file", batchFile);
 
     try {
-      const response = await axios.post('http://127.0.0.1:8000/batch-predict', formData, {
+      const response = await axios.post('https://hr-predictive-analytics.onrender.com/batch-predict', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
       setBatchResults(response.data);
@@ -158,7 +158,6 @@ export default function AdminDashboard({ user, onLogout }) {
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                   <div className="col-span-2 bg-white p-6 rounded-xl shadow-sm border border-slate-100">
                     <h3 className="font-bold text-slate-700 mb-6 flex items-center gap-2"><BarChart2 size={18}/> Average Attrition Risk by Department (%)</h3>
-                    {/* Replaced relative height with a fixed 250px to stop the Recharts infinite loop */}
                     <div style={{ width: '100%', height: 250 }}>
                       <ResponsiveContainer>
                         <BarChart data={companyData.departments}>
@@ -173,7 +172,6 @@ export default function AdminDashboard({ user, onLogout }) {
                   </div>
                   <div className="col-span-1 bg-white p-6 rounded-xl shadow-sm border border-slate-100">
                     <h3 className="font-bold text-slate-700 mb-6">Company Risk Distribution</h3>
-                    {/* Replaced relative height with a fixed 250px to stop the Recharts infinite loop */}
                     <div style={{ width: '100%', height: 250 }}>
                       <ResponsiveContainer>
                         <PieChart>
