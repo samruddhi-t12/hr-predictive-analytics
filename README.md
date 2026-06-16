@@ -103,5 +103,3 @@ The frontend will now be running on http://localhost:5173
 ## 🔒 Security & CORS
 The production backend is strictly configured to only accept requests from the deployed Vercel frontend domain via explicit CORS middleware configurations. Authentication payloads are secured using industry-standard bcrypt hashing before database insertion.
 
-## 👨‍💻 Author
-Samruddhi Thorat
