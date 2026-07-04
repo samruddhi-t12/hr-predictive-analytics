@@ -21,6 +21,14 @@ A decoupled, full-stack predictive analytics pipeline designed to identify emplo
 
 ---
 
+##  📊 Model Design Decision
+
+The model's decision threshold was tuned to favor recall (59%) over precision. In an attrition
+context, a false negative (missing an employee who is about to leave) is materially more
+costly than a false positive (flagging a stable employee for review) — the former is a lost
+retention opportunity, the latter is a low-cost manager check-in. This tradeoff, not raw
+F1-score, is the correct lens for evaluating this model's fitness for its actual use case.
+
 ## 🛠️ Technical Architecture
 
 ### 1. Model Training & Pipeline (Offline)
@@ -42,6 +50,22 @@ A decoupled, full-stack predictive analytics pipeline designed to identify emplo
 
 ---
 
+
+## 🏗️ System Architecture
+
+```mermaid
+flowchart LR
+    A[HR CSV Upload] --> B[FastAPI Backend]
+    B --> C[Scikit-Learn Attrition Model]
+    C --> D[SHAP Explainability]
+    D --> E[Gemini API]
+    E --> F[Retention Strategy]
+    B --> G[(PostgreSQL)]
+    G --> H[React Dashboard]
+```
+---
+
+
 ## 💻 Local Setup Instructions
 
 ### Prerequisites
@@ -52,7 +76,7 @@ A decoupled, full-stack predictive analytics pipeline designed to identify emplo
 
 ### 1. Clone the Repository
 ```bash
-git clone [https://github.com/samruddhi-t12/hr-predictive-analytics.git](https://github.com/samruddhi-t12/hr-predictive-analytics.git)
+git clone https://github.com/samruddhi-t12/hr-predictive-analytics.git
 cd hr-predictive-analytics
 cd backend
 ```
